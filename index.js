@@ -12,7 +12,20 @@ const PORT = process.env.PORT || 3000;
 
 const config = { DATA_FILE: process.env.DATA_FILE || 'data.json' };
 
-app.use(compression());
+// ===== OPTIMIZACIÓN 1: Compresión SOLO para contenido que lo necesita =====
+app.use(compression({
+    filter: (req, res) => {
+        // NO comprimir streams de video/audio
+        if (req.path === '/video-proxy') return false;
+        if (req.headers.accept && (
+            req.headers.accept.includes('video') || 
+            req.headers.accept.includes('audio')
+        )) return false;
+        return compression.filter(req, res);
+    },
+    level: 6
+}));
+
 app.use(helmet({
     contentSecurityPolicy: {
         directives: {
@@ -20,13 +33,19 @@ app.use(helmet({
             styleSrc: ["'self'", "'unsafe-inline'"],
             scriptSrc: ["'self'", "'unsafe-inline'"],
             imgSrc: ["'self'", "data:", "https:", "http:"],
-            mediaSrc: ["'self'", "blob:", "data:", "https:", "http:"],
-            connectSrc: ["'self'", "https:", "http:"]
+            mediaSrc: ["'self'", "blob:", "data:", "https:", "http:", "*"],
+            connectSrc: ["'self'", "https:", "http:", "*"]
         }
-    }
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" }
 }));
 
-const videoProxyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+const videoProxyLimiter = rateLimit({ 
+    windowMs: 15 * 60 * 1000, 
+    max: 500, // Aumentado para streaming
+    skip: (req) => req.headers.range // No limitar requests de range
+});
 
 let SERIES_LIST = [];
 let SERIES_INDEX = {};
@@ -59,7 +78,19 @@ function loadData() {
 
 loadData();
 
-app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
+// ===== OPTIMIZACIÓN 2: Headers CORS mejorados para streaming =====
+app.use((req, res, next) => { 
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Accept');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length, Content-Type');
+
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+    }
+    next(); 
+});
+
 app.get('/api/stats', (req, res) => res.json({ series: SERIES_LIST.length, episodes: TOTAL_EPISODES }));
 
 app.get('/api/series', (req, res) => {
@@ -80,28 +111,109 @@ app.get('/api/series/:name', (req, res) => {
     res.json({ data: series });
 });
 
+// ===== OPTIMIZACIÓN 3: Proxy de Video COMPLETAMENTE REESCRITO =====
 app.get('/video-proxy', videoProxyLimiter, (req, res) => {
     const url = req.query.url;
-    if (!url) return res.status(400).end();
+    if (!url) return res.status(400).json({ error: 'URL requerida' });
+
+    let parsed;
     try {
-        const parsed = new URL(decodeURIComponent(url));
-        const client = parsed.protocol === 'https:' ? https : http;
-        const opts = { hostname: parsed.hostname, port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80), path: parsed.pathname + parsed.search, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*', 'Accept-Encoding': 'identity' } };
-        if (req.headers.range) opts.headers['Range'] = req.headers.range;
-        const proxyReq = client.request(opts, proxyRes => {
-            if ([301, 302, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) return res.redirect('/video-proxy?url=' + encodeURIComponent(proxyRes.headers.location));
-            res.status(proxyRes.statusCode);
-            res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'video/mp4');
-            res.setHeader('Accept-Ranges', 'bytes');
-            if (proxyRes.headers['content-length']) res.setHeader('Content-Length', proxyRes.headers['content-length']);
-            if (proxyRes.headers['content-range']) res.setHeader('Content-Range', proxyRes.headers['content-range']);
-            proxyRes.pipe(res);
+        parsed = new URL(decodeURIComponent(url));
+    } catch (e) {
+        return res.status(400).json({ error: 'URL inválida' });
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http;
+
+    const opts = { 
+        hostname: parsed.hostname, 
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80), 
+        path: parsed.pathname + parsed.search, 
+        method: 'GET',
+        timeout: 30000, // 30 segundos timeout
+        headers: { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'es-ES,es;q=0.9,en;q=0.8',
+            'Accept-Encoding': 'identity', // Sin compresión para video
+            'Connection': 'keep-alive',
+            'Referer': parsed.origin + '/'
+        } 
+    };
+
+    // ===== CRÍTICO: Pasar Range header para streaming =====
+    if (req.headers.range) {
+        opts.headers['Range'] = req.headers.range;
+    }
+
+    const proxyReq = client.request(opts, proxyRes => {
+        // Manejar redirects
+        if ([301, 302, 303, 307, 308].includes(proxyRes.statusCode) && proxyRes.headers.location) {
+            // Limpiar listeners para evitar memory leak
+            proxyRes.destroy();
+            return res.redirect('/video-proxy?url=' + encodeURIComponent(proxyRes.headers.location));
+        }
+
+        // Headers de respuesta optimizados para streaming
+        const headers = {
+            'Content-Type': proxyRes.headers['content-type'] || 'video/mp4',
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'public, max-age=3600',
+            'X-Content-Type-Options': 'nosniff'
+        };
+
+        // Headers críticos para Range requests
+        if (proxyRes.headers['content-length']) {
+            headers['Content-Length'] = proxyRes.headers['content-length'];
+        }
+        if (proxyRes.headers['content-range']) {
+            headers['Content-Range'] = proxyRes.headers['content-range'];
+        }
+
+        // Status code correcto (206 para partial content)
+        const statusCode = proxyRes.statusCode;
+        res.writeHead(statusCode, headers);
+
+        // ===== CRÍTICO: Streaming directo sin buffering completo =====
+        proxyRes.pipe(res, { end: true });
+
+        // Manejo de errores en el stream
+        proxyRes.on('error', (err) => {
+            console.error('[PROXY STREAM ERROR]', err.message);
+            if (!res.headersSent) {
+                res.status(502).json({ error: 'Stream error' });
+            } else {
+                res.end();
+            }
         });
-        proxyReq.on('error', () => res.status(502).end());
-        proxyReq.end();
-    } catch (e) { res.status(400).end(); }
+    });
+
+    // Timeout
+    proxyReq.on('timeout', () => {
+        console.error('[PROXY TIMEOUT]');
+        proxyReq.destroy();
+        if (!res.headersSent) {
+            res.status(504).json({ error: 'Timeout' });
+        }
+    });
+
+    // Error de conexión
+    proxyReq.on('error', (err) => {
+        console.error('[PROXY ERROR]', err.message);
+        if (!res.headersSent) {
+            res.status(502).json({ error: 'Connection error' });
+        }
+    });
+
+    // Cuando el cliente cierra la conexión
+    req.on('close', () => {
+        proxyReq.destroy();
+    });
+
+    proxyReq.end();
 });
 
+// ===== OPTIMIZACIÓN 4: HTML con Player Mejorado =====
 const HTML = `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -163,6 +275,7 @@ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 
 .p-top{padding:16px 20px;background:linear-gradient(#000a,transparent)}
 .p-title{font-size:15px;font-weight:600}
+.p-status{font-size:12px;color:var(--text2);margin-top:4px}
 
 .p-center{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:48px;font-weight:700;opacity:0;transition:opacity .15s}
 .p-center.show{opacity:1}
@@ -179,9 +292,9 @@ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 .p-time:last-child{text-align:right}
 .p-bar{flex:1;height:4px;background:#444;border-radius:2px;position:relative;cursor:pointer}
 .p-bar.f{height:6px;box-shadow:0 0 0 2px var(--focus)}
-.p-bar-fill{position:absolute;left:0;top:0;height:100%;background:var(--accent);border-radius:2px}
-.p-bar-buf{position:absolute;left:0;top:0;height:100%;background:#666;border-radius:2px;z-index:-1}
-.p-bar-dot{position:absolute;top:50%;transform:translate(-50%,-50%);width:14px;height:14px;background:#fff;border-radius:50%;opacity:0}
+.p-bar-fill{position:absolute;left:0;top:0;height:100%;background:var(--accent);border-radius:2px;z-index:2}
+.p-bar-buf{position:absolute;left:0;top:0;height:100%;background:#666;border-radius:2px;z-index:1}
+.p-bar-dot{position:absolute;top:50%;transform:translate(-50%,-50%);width:14px;height:14px;background:#fff;border-radius:50%;opacity:0;z-index:3}
 .p-bar.f .p-bar-dot{opacity:1}
 
 .p-ctrl{display:flex;justify-content:center;gap:12px}
@@ -203,13 +316,16 @@ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
 
 .p-err{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;display:none}
 .p-err.show{display:block}
-.p-err-t{font-size:16px;margin-bottom:16px}
-.p-err-btn{padding:12px 24px;background:var(--accent);border:2px solid transparent;border-radius:8px;color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+.p-err-t{font-size:16px;margin-bottom:8px}
+.p-err-sub{font-size:12px;color:var(--text2);margin-bottom:16px}
+.p-err-btn{padding:12px 24px;background:var(--accent);border:2px solid transparent;border-radius:8px;color:#fff;font-size:14px;font-weight:600;cursor:pointer;margin:4px}
 .p-err-btn.f{border-color:var(--focus)}
+.p-err-btn.sec{background:transparent;border-color:var(--border)}
 
-.p-load{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:none}
+.p-load{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);display:none;text-align:center}
 .p-load.show{display:block}
-.p-load::after{content:'';display:block;width:40px;height:40px;border:3px solid #333;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+.p-load-spin{width:40px;height:40px;border:3px solid #333;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}
+.p-load-txt{font-size:12px;color:var(--text2)}
 
 .msg{text-align:center;padding:60px 20px;color:var(--text2)}
 .msg.load::after{content:'';display:block;width:24px;height:24px;margin:16px auto 0;border:2px solid #333;border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
@@ -239,11 +355,16 @@ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
     </div>
 
     <div class="player" id="player">
-        <video id="vid" playsinline></video>
-        <div class="p-load" id="p-load"></div>
+        <video id="vid" playsinline preload="auto"></video>
+        <div class="p-load" id="p-load">
+            <div class="p-load-spin"></div>
+            <div class="p-load-txt" id="p-load-txt">Cargando...</div>
+        </div>
         <div class="p-err" id="p-err">
             <div class="p-err-t">Error de reproducción</div>
+            <div class="p-err-sub" id="p-err-sub">No se pudo cargar el video</div>
             <button class="p-err-btn" id="p-retry">Reintentar</button>
+            <button class="p-err-btn sec" id="p-back">Volver</button>
         </div>
         <div class="p-center" id="p-ind"></div>
         <div class="p-vol" id="p-vol">
@@ -253,6 +374,7 @@ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
         <div class="p-ui" id="p-ui">
             <div class="p-top">
                 <div class="p-title" id="p-title"></div>
+                <div class="p-status" id="p-status"></div>
             </div>
             <div class="p-next" id="p-next">
                 <div class="p-next-lbl">Siguiente</div>
@@ -299,16 +421,18 @@ const state = {
     cols: 5,
     focused: null,
     playing: false,
-    lastFocused: { home: null, detail: null }
+    lastFocused: { home: null, detail: null },
+    retryCount: 0,
+    maxRetries: 3
 };
 
-let hideT, volT, indT, nextT;
+let hideT, volT, indT, nextT, bufferCheckT;
 
 const el = {
     grid: $('grid'), main: $('main'), srch: $('srch'), mix: $('mix'), stats: $('stats'),
     detail: $('detail'), detBack: $('det-back'), detTitle: $('det-title'), tabs: $('tabs'), eps: $('eps'),
-    player: $('player'), vid: $('vid'), pUi: $('p-ui'), pTitle: $('p-title'),
-    pLoad: $('p-load'), pErr: $('p-err'), pRetry: $('p-retry'),
+    player: $('player'), vid: $('vid'), pUi: $('p-ui'), pTitle: $('p-title'), pStatus: $('p-status'),
+    pLoad: $('p-load'), pLoadTxt: $('p-load-txt'), pErr: $('p-err'), pErrSub: $('p-err-sub'), pRetry: $('p-retry'), pBack: $('p-back'),
     pInd: $('p-ind'), pVol: $('p-vol'), pVolFill: $('p-vol-fill'), pVolPct: $('p-vol-pct'),
     pBar: $('p-bar'), pBarFill: $('p-bar-fill'), pBarBuf: $('p-bar-buf'), pBarDot: $('p-bar-dot'),
     pCur: $('p-cur'), pDur: $('p-dur'),
@@ -316,13 +440,9 @@ const el = {
     pNext: $('p-next'), pNextT: $('p-next-t'), pNextCd: $('p-next-cd'), pNextPlay: $('p-next-play'), pNextCancel: $('p-next-cancel')
 };
 
-// ===== HISTORY API - CLAVE PARA WEBVIEW =====
-// Esto hace que el botón Back del sistema navegue dentro de la app
+// ===== HISTORY API =====
 function initHistory() {
-    // Crear entrada inicial
     history.replaceState({ view: 'home' }, '', '#home');
-
-    // Escuchar popstate (cuando el usuario presiona Back)
     window.addEventListener('popstate', function(e) {
         handleHistoryBack(e.state);
     });
@@ -333,27 +453,18 @@ function pushView(view) {
 }
 
 function handleHistoryBack(historyState) {
-    // Si no hay estado, significa que estamos en home
     if (!historyState) {
-        // Agregar entrada para prevenir cierre
         history.pushState({ view: 'home' }, '', '#home');
         return;
     }
 
-    const prevView = historyState.view;
-
     if (state.view === 'player') {
-        // Cerrar player sin tocar historial (ya se hizo pop)
         closePlayerInternal();
-        // Asegurar que detail tenga entrada
         history.pushState({ view: 'detail' }, '', '#detail');
     } else if (state.view === 'detail') {
-        // Cerrar detail sin tocar historial
         closeDetailInternal();
-        // Asegurar que home tenga entrada
         history.pushState({ view: 'home' }, '', '#home');
     } else {
-        // En home - agregar entrada para prevenir cierre de app
         history.pushState({ view: 'home' }, '', '#home');
     }
 }
@@ -379,8 +490,6 @@ function calcCols() {
 
 function onKey(e) {
     const k = e.key;
-    const kc = e.keyCode;
-
     const navKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', ' '];
 
     if (navKeys.includes(k)) {
@@ -388,13 +497,11 @@ function onKey(e) {
         e.stopPropagation();
     }
 
-    // Player
     if (state.view === 'player') {
         playerKey(k);
         return;
     }
 
-    // Search
     if (document.activeElement === el.srch) {
         if (k === 'ArrowDown') {
             el.srch.blur();
@@ -510,7 +617,7 @@ function activate() {
     state.focused.click();
 }
 
-// ===== PLAYER =====
+// ===== PLAYER OPTIMIZADO =====
 function playerKey(k) {
     showUI();
     switch (k) {
@@ -523,12 +630,18 @@ function playerKey(k) {
 }
 
 function togglePlay() {
-    if (el.vid.paused) { el.vid.play(); showInd('PLAY'); }
-    else { el.vid.pause(); showInd('PAUSE'); }
+    if (el.vid.paused) { 
+        el.vid.play().catch(handlePlayError); 
+        showInd('▶'); 
+    } else { 
+        el.vid.pause(); 
+        showInd('⏸'); 
+    }
 }
 
 function seek(s) {
-    el.vid.currentTime = Math.max(0, Math.min(el.vid.currentTime + s, el.vid.duration || 0));
+    const newTime = Math.max(0, Math.min(el.vid.currentTime + s, el.vid.duration || 0));
+    el.vid.currentTime = newTime;
     showInd((s > 0 ? '+' : '') + s + 's');
 }
 
@@ -561,19 +674,92 @@ function showUI() {
     }, 3000);
 }
 
+// ===== OPTIMIZACIÓN 5: Manejo mejorado de eventos de video =====
 function setupPlayer() {
     const v = el.vid;
-    v.addEventListener('loadstart', () => { el.pLoad.classList.add('show'); el.pErr.classList.remove('show'); });
-    v.addEventListener('canplay', () => el.pLoad.classList.remove('show'));
-    v.addEventListener('waiting', () => el.pLoad.classList.add('show'));
-    v.addEventListener('playing', () => { el.pLoad.classList.remove('show'); state.playing = true; el.pPp.textContent = 'PAUSE'; hideNext(); });
-    v.addEventListener('pause', () => { state.playing = false; el.pPp.textContent = 'PLAY'; });
-    v.addEventListener('timeupdate', () => { updateProg(); checkNext(); });
+
+    // Configuración óptima del video
+    v.preload = 'auto';
+    v.playsInline = true;
+
+    v.addEventListener('loadstart', () => { 
+        el.pLoad.classList.add('show'); 
+        el.pErr.classList.remove('show'); 
+        el.pLoadTxt.textContent = 'Conectando...';
+        updateStatus('Conectando...');
+    });
+
+    v.addEventListener('loadedmetadata', () => {
+        el.pLoadTxt.textContent = 'Cargando video...';
+        updateStatus('Preparando...');
+    });
+
+    v.addEventListener('loadeddata', () => {
+        el.pLoadTxt.textContent = 'Casi listo...';
+    });
+
+    v.addEventListener('canplay', () => {
+        el.pLoad.classList.remove('show');
+        updateStatus('');
+        state.retryCount = 0; // Reset retry count on success
+    });
+
+    v.addEventListener('canplaythrough', () => {
+        el.pLoad.classList.remove('show');
+        updateStatus('');
+    });
+
+    v.addEventListener('waiting', () => { 
+        el.pLoad.classList.add('show');
+        el.pLoadTxt.textContent = 'Buffering...';
+        updateStatus('Buffering...');
+    });
+
+    v.addEventListener('playing', () => { 
+        el.pLoad.classList.remove('show'); 
+        state.playing = true; 
+        el.pPp.textContent = 'PAUSE'; 
+        hideNext();
+        updateStatus('');
+        startBufferMonitor();
+    });
+
+    v.addEventListener('pause', () => { 
+        state.playing = false; 
+        el.pPp.textContent = 'PLAY';
+        stopBufferMonitor();
+    });
+
+    v.addEventListener('timeupdate', () => { 
+        updateProg(); 
+        checkNext(); 
+    });
+
     v.addEventListener('progress', updateBuf);
-    v.addEventListener('durationchange', () => { el.pDur.textContent = fmt(v.duration); });
+
+    v.addEventListener('durationchange', () => { 
+        el.pDur.textContent = fmt(v.duration); 
+    });
+
     v.addEventListener('volumechange', updateVol);
-    v.addEventListener('ended', showNext);
-    v.addEventListener('error', () => { el.pLoad.classList.remove('show'); el.pErr.classList.add('show'); });
+
+    v.addEventListener('ended', () => {
+        stopBufferMonitor();
+        showNext();
+    });
+
+    // ===== OPTIMIZACIÓN 6: Manejo mejorado de errores =====
+    v.addEventListener('error', handleVideoError);
+
+    v.addEventListener('stalled', () => {
+        console.log('Stream stalled, checking connection...');
+        updateStatus('Reconectando...');
+        el.pLoadTxt.textContent = 'Reconectando...';
+    });
+
+    v.addEventListener('suspend', () => {
+        console.log('Download suspended');
+    });
 
     el.pPp.onclick = togglePlay;
     el.pRw.onclick = () => seek(-10);
@@ -581,12 +767,80 @@ function setupPlayer() {
     el.pPrev.onclick = prevEp;
     el.pNxt.onclick = nextEp;
     el.pRetry.onclick = retry;
+    el.pBack.onclick = () => history.back();
     el.pNextPlay.onclick = nextEp;
     el.pNextCancel.onclick = cancelNext;
     el.pBar.onclick = e => {
         const r = el.pBar.getBoundingClientRect();
-        el.vid.currentTime = ((e.clientX - r.left) / r.width) * el.vid.duration;
+        const percent = (e.clientX - r.left) / r.width;
+        el.vid.currentTime = percent * el.vid.duration;
     };
+}
+
+function handleVideoError(e) {
+    console.error('Video error:', e);
+    const error = el.vid.error;
+    let msg = 'Error desconocido';
+
+    if (error) {
+        switch(error.code) {
+            case 1: msg = 'Carga abortada'; break;
+            case 2: msg = 'Error de red'; break;
+            case 3: msg = 'Error de decodificación'; break;
+            case 4: msg = 'Formato no soportado'; break;
+        }
+    }
+
+    el.pErrSub.textContent = msg;
+
+    // Auto-retry para errores de red
+    if (error && error.code === 2 && state.retryCount < state.maxRetries) {
+        state.retryCount++;
+        el.pLoadTxt.textContent = 'Reintentando... (' + state.retryCount + '/' + state.maxRetries + ')';
+        updateStatus('Reintentando...');
+        setTimeout(retry, 2000);
+    } else {
+        el.pLoad.classList.remove('show'); 
+        el.pErr.classList.add('show');
+        stopBufferMonitor();
+    }
+}
+
+function handlePlayError(e) {
+    console.error('Play error:', e);
+    if (e.name === 'NotAllowedError') {
+        // Autoplay blocked, show play button
+        el.pPp.textContent = 'PLAY';
+    }
+}
+
+function updateStatus(text) {
+    el.pStatus.textContent = text;
+}
+
+// ===== OPTIMIZACIÓN 7: Monitor de buffer =====
+function startBufferMonitor() {
+    stopBufferMonitor();
+    bufferCheckT = setInterval(() => {
+        if (el.vid.buffered.length > 0) {
+            const buffered = el.vid.buffered.end(el.vid.buffered.length - 1);
+            const current = el.vid.currentTime;
+            const bufferAhead = buffered - current;
+
+            if (bufferAhead < 2 && !el.vid.paused) {
+                updateStatus('Buffer bajo...');
+            } else if (bufferAhead > 5) {
+                updateStatus('');
+            }
+        }
+    }, 1000);
+}
+
+function stopBufferMonitor() {
+    if (bufferCheckT) {
+        clearInterval(bufferCheckT);
+        bufferCheckT = null;
+    }
 }
 
 function updateProg() {
@@ -605,8 +859,20 @@ function updateBuf() {
 
 function retry() {
     el.pErr.classList.remove('show');
-    const s = el.vid.src; el.vid.src = ''; el.vid.src = s;
-    el.vid.play().catch(() => {});
+    el.pLoad.classList.add('show');
+    el.pLoadTxt.textContent = 'Reintentando...';
+
+    const currentTime = el.vid.currentTime;
+    const src = el.vid.src;
+
+    el.vid.src = '';
+
+    // Pequeño delay antes de reintentar
+    setTimeout(() => {
+        el.vid.src = src;
+        el.vid.currentTime = currentTime;
+        el.vid.play().catch(handlePlayError);
+    }, 500);
 }
 
 function checkNext() {
@@ -632,15 +898,46 @@ function hideNext() { el.pNext.classList.remove('show'); if (nextT) { clearInter
 function cancelNext() { hideNext(); }
 function hasNext() { return state.series && state.epIdx < state.series.seasons[state.season].length - 1; }
 function getNext() { return state.series.seasons[state.season][state.epIdx + 1]; }
-function nextEp() { hideNext(); if (hasNext()) { state.epIdx++; playEp(getNext()); } }
+function nextEp() { hideNext(); if (hasNext()) { state.epIdx++; playEp(state.series.seasons[state.season][state.epIdx]); } }
 function prevEp() { if (state.epIdx > 0) { state.epIdx--; playEp(state.series.seasons[state.season][state.epIdx]); } }
 
+// ===== OPTIMIZACIÓN 8: Función de reproducción mejorada =====
 function playEp(ep) {
+    state.retryCount = 0;
+    hideNext();
+    el.pErr.classList.remove('show');
+    el.pLoad.classList.add('show');
+    el.pLoadTxt.textContent = 'Conectando...';
+
     let u = ep.url;
-    if (u.startsWith('http://')) u = '/video-proxy?url=' + encodeURIComponent(u);
-    el.vid.src = u;
-    el.pTitle.textContent = ep.title;
-    el.vid.play().catch(() => {});
+    // Usar proxy para URLs HTTP o si hay problemas de CORS
+    if (u.startsWith('http://') || shouldUseProxy(u)) {
+        u = '/video-proxy?url=' + encodeURIComponent(u);
+    }
+
+    // Limpiar video anterior
+    el.vid.pause();
+    el.vid.removeAttribute('src');
+    el.vid.load();
+
+    // Pequeño delay para asegurar limpieza
+    setTimeout(() => {
+        el.vid.src = u;
+        el.pTitle.textContent = ep.title;
+        el.vid.play().catch(handlePlayError);
+        showUI();
+    }, 100);
+}
+
+function shouldUseProxy(url) {
+    // Lista de dominios que necesitan proxy
+    const proxyDomains = ['example.com']; // Añadir dominios problemáticos
+    try {
+        const parsed = new URL(url);
+        return proxyDomains.some(d => parsed.hostname.includes(d));
+    } catch {
+        return false;
+    }
 }
 
 function fmt(s) {
@@ -696,7 +993,7 @@ function openDetail(name) {
     saveFocus();
     state.view = 'detail';
     state.lastFocused.detail = null;
-    pushView('detail'); // Agregar al historial
+    pushView('detail');
     el.detTitle.textContent = name;
     el.detail.classList.add('open');
     el.tabs.innerHTML = '<div class="msg load"></div>';
@@ -740,7 +1037,6 @@ function renderEps() {
     });
 }
 
-// Cierra detail SIN tocar historial (llamado desde popstate)
 function closeDetailInternal() {
     el.detail.classList.remove('open');
     state.view = 'home';
@@ -749,7 +1045,6 @@ function closeDetailInternal() {
     setTimeout(focusFirst, 50);
 }
 
-// Cierra detail Y maneja historial (llamado desde botón)
 function closeDetail() {
     history.back();
 }
@@ -758,29 +1053,22 @@ function closeDetail() {
 function openPlayer(ep) {
     saveFocus();
     state.view = 'player';
-    pushView('player'); // Agregar al historial
-    hideNext();
-    el.pErr.classList.remove('show');
-    let u = ep.url;
-    if (u.startsWith('http://')) u = '/video-proxy?url=' + encodeURIComponent(u);
-    el.vid.src = u;
-    el.pTitle.textContent = ep.title;
+    pushView('player');
+    playEp(ep);
     el.player.classList.add('open');
-    el.vid.play().catch(() => {});
-    showUI();
 }
 
-// Cierra player SIN tocar historial (llamado desde popstate)
 function closePlayerInternal() {
     el.vid.pause();
-    el.vid.src = '';
+    el.vid.removeAttribute('src');
+    el.vid.load();
     el.player.classList.remove('open');
     state.view = 'detail';
     hideNext();
+    stopBufferMonitor();
     setTimeout(focusFirst, 50);
 }
 
-// Cierra player Y maneja historial (llamado desde botón)
 function closePlayer() {
     history.back();
 }
@@ -799,6 +1087,7 @@ function setupMouse() {
     };
     el.player.onclick = e => { if (e.target === el.vid) { togglePlay(); showUI(); } };
     el.player.onmousemove = showUI;
+    el.player.ontouchmove = showUI;
 }
 
 function esc(s) { return s ? String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]) : '' }
